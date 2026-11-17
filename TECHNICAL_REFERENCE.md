@@ -221,15 +221,41 @@ g.remove_gear_from_activity(gearUUID="uuid-string", activity_id=12345)
 
 ### 认证
 
-Stryd 使用 AWS Cognito。Token 存在浏览器 Local Storage（`https://www.stryd.com` → `token`），**有效期约 12 小时**，必须用 refresh token 自动刷新。
+Stryd 存在**新旧两套 auth 体系**，实现时必须先判断再选择刷新路径。
 
-**首次获取**（浏览器手动）：
-打开 stryd.com → DevTools → Application → Local Storage → 复制：
-- `token`（access token）
-- `refreshToken`
-- `refreshClientId`
+#### 判断方式：解码 JWT payload
 
-**自动刷新**：
+```python
+import base64, json
+
+def decode_jwt_payload(token):
+    payload = token.split(".")[1] + "=="
+    return json.loads(base64.urlsafe_b64decode(payload.encode()))
+
+payload = decode_jwt_payload(token)
+is_old = payload.get("iss") == "stryd"   # True = 旧版，False = 新版 Cognito
+```
+
+旧版特征：`iss` 字段值为 `"stryd"`，`refreshClientId` 是 UUID 格式（`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`）。
+新版特征：`iss` 是 Cognito 地址，`refreshClientId` 是 Cognito 应用 ID（非 UUID 格式）。
+
+#### 旧版 Stryd 自家后端刷新
+
+```http
+POST https://api.stryd.com/b/api/v1/auth/token
+Content-Type: application/json
+
+{
+  "grant_type": "refresh_token",
+  "refresh_token": "<refreshToken>",
+  "client_id": "<refreshClientId 或 'stryd'>"
+}
+```
+
+响应字段：`token`（新 access token）、`expiresIn`（秒）、`refreshToken`（可能轮换）
+
+#### 新版 Cognito 刷新
+
 ```http
 POST https://auth.stryd.com/oauth2/token
 Content-Type: application/x-www-form-urlencoded
@@ -237,16 +263,11 @@ Content-Type: application/x-www-form-urlencoded
 grant_type=refresh_token&client_id=<refreshClientId>&refresh_token=<refreshToken>
 ```
 
-响应：
-```json
-{
-  "access_token": "eyJ...",
-  "expires_in": 3600,
-  "refresh_token": "新的refresh_token（Cognito会轮换）"
-}
-```
+响应字段：`access_token`、`expires_in`（秒）、`refresh_token`（可能轮换）
 
-**每次调用前检查过期时间（留 5 分钟余量），过期则刷新，刷新后保存新 token。**
+#### Token 有效期
+
+新旧版有效期都约为 **12 小时**。每次 API 调用前检查过期时间（建议留 5 分钟余量），过期则刷新，刷新后持久化新 token。
 
 ### 获取用户 ID
 

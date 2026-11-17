@@ -101,34 +101,33 @@ SHOE_MAP = {
 
 # ── Stryd ─────────────────────────────────────────────────────────────────────
 STRYD_BASE    = "https://api.stryd.com/b/api/v1"
-STRYD_USER_ID = ""  # fetched automatically from /users/me on first use
-# Run create_stryd_shoes.py --apply to populate these IDs for your account.
+STRYD_USER_ID = "8f3c39b2-7e0c-5c22-5c99-0efc0c250fc5"
 SHOE_ID_MAP: dict[str, int | None] = {
-    "ASICS Nimbus24":                    None,
-    "ASICS NovaBlast 3":                 None,
-    "Adidas Adizero Evo SL":             None,
-    "Altra Olympus 5 Vettle":            None,
-    "Brooks Glycerin 21":                None,
-    "Brooks Hyperion Max":               None,
-    "Dynafish 大鲶 安东鲵":               None,
-    "Dynafish 小鲶":                      None,
-    "HOKA Clifton 9 后备箱里的黑户":       None,
-    "HOKA Mafate Speed 4":               None,
-    "Li-ning 赤兔9U":                     None,
-    "New Balance FuelCell SC Elite V4":  None,
-    "New Balance Rebel v5":              None,
-    "New Balance rebel v4":              None,
-    "Nike Infinity Run 4":               None,
-    "Nike Kiger 10":                     None,
-    "Nike Vomero Plus":                  None,
-    "On Cloud X":                        None,
-    "On Cloudboom Echo3":                None,
-    "On Cloudsurfer":                    None,
-    "Saucony Endorphin Speed 3 小三":    None,
-    "Saucony Endorphin Speed 4 Berlin":  None,
-    "Saucony Triumph 20":                None,
-    "Saucony Triumph20":                 None,
-    "Saucony Trumph 21SE":               None,
+    "ASICS Nimbus24":                    6750464048529408,
+    "ASICS NovaBlast 3":                 5591950710177792,
+    "Adidas Adizero Evo SL":             5168329307095040,
+    "Altra Olympus 5 Vettle":            6159116576653312,
+    "Brooks Glycerin 21":                5966387905200128,
+    "Brooks Hyperion Max":               4847624824717312,
+    "Dynafish 大鲶 安东鲵":               4914568399585280,
+    "Dynafish 小鲶":                      5483836182790144,
+    "HOKA Clifton 9 后备箱里的黑户":       4741199595208704,
+    "HOKA Mafate Speed 4":               5068361816768512,
+    "Li-ning 赤兔9U":                     6021763925180416,
+    "New Balance FuelCell SC Elite V4":  6180972457263104,
+    "New Balance Rebel v5":              5167757673791488,
+    "New Balance rebel v4":              4691908436590592,
+    "Nike Infinity Run 4":               6343623137198080,
+    "Nike Kiger 10":                     4843868473163776,
+    "Nike Vomero Plus":                  5776178701828096,
+    "On Cloud X":                        5178021693521920,
+    "On Cloudboom Echo3":                4876987368636416,
+    "On Cloudsurfer":                    6286462302453760,
+    "Saucony Endorphin Speed 3 小三":    5156469023342592,
+    "Saucony Endorphin Speed 4 Berlin":  4800514536407040,
+    "Saucony Triumph 20":                4927135205457920,
+    "Saucony Triumph20":                 4927135205457920,
+    "Saucony Trumph 21SE":               6107661660487680,
 }
 
 BIKE_TYPES = {"Ride", "Virtual Ride", "VirtualRide", "E-Bike Ride", "EBikeRide"}
@@ -285,50 +284,79 @@ def sync_garmin_activity(g: Garmin, garmin_act: dict,
     return "linked"
 
 # ── Stryd helpers ─────────────────────────────────────────────────────────────
-STRYD_AUTH_BASE = "https://auth.stryd.com"
+STRYD_AUTH_BASE = "https://auth.stryd.com"       # new system (Cognito)
+STRYD_OLD_AUTH  = f"{STRYD_BASE}/auth/token"     # old system (Stryd backend, iss="stryd")
+
+def _decode_jwt_payload(token: str) -> dict:
+    """Decode JWT payload without verification."""
+    try:
+        import base64 as _b
+        payload = token.split(".")[1] + "=="
+        return json.loads(_b.urlsafe_b64decode(payload.encode()))
+    except Exception:
+        return {}
+
+def _stryd_is_old_auth(token: str) -> bool:
+    """Return True if the token was issued by the old Stryd backend (not Cognito)."""
+    return _decode_jwt_payload(token).get("iss") == "stryd"
 
 def stryd_ensure_token(state: dict) -> str | None:
-    """Return a valid Stryd access token, auto-refreshing via Cognito if expired."""
-    token = state.get("stryd_token", "")
+    """Return a valid Stryd access token, refreshing automatically if expired."""
+    token      = state.get("stryd_token", "")
     expires_at = state.get("stryd_expires_at", 0)
-    now = int(time.time())
+    now        = int(time.time())
 
     # Token still valid (5 min buffer)
     if token and expires_at and expires_at > now + 300:
         return token
 
-    # Try to refresh
     refresh_token  = state.get("stryd_refresh_token", "")
     refresh_client = state.get("stryd_refresh_client_id", "")
-    if not refresh_token or not refresh_client:
-        if token:
-            return token   # no refresh info, return existing token and hope for the best
-        return None
 
-    r = requests.post(
-        f"{STRYD_AUTH_BASE}/oauth2/token",
-        data={
-            "grant_type":    "refresh_token",
-            "client_id":     refresh_client,
-            "refresh_token": refresh_token,
-        },
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        timeout=30,
-    )
+    if not refresh_token:
+        # No refresh info at all — return existing token and let caller handle 401
+        return token or None
+
+    old_auth = _stryd_is_old_auth(token) if token else bool(refresh_client and "-" in refresh_client)
+
+    if old_auth:
+        # Old Stryd backend: POST to Stryd's own auth endpoint
+        r = requests.post(
+            STRYD_OLD_AUTH,
+            json={
+                "grant_type":    "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id":     refresh_client or "stryd",
+            },
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            timeout=30,
+        )
+    else:
+        # New Cognito system
+        r = requests.post(
+            f"{STRYD_AUTH_BASE}/oauth2/token",
+            data={
+                "grant_type":    "refresh_token",
+                "client_id":     refresh_client,
+                "refresh_token": refresh_token,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=30,
+        )
+
     if r.status_code != 200:
         print(f"  Stryd token refresh failed ({r.status_code}), using existing token.")
         return token or None
-    data = r.json()
-    new_token = data.get("access_token", token)
-    # Cognito returns expires_in (seconds)
-    expires_in = data.get("expires_in", 3600)
+
+    data       = r.json()
+    new_token  = data.get("access_token") or data.get("token") or token
+    expires_in = data.get("expires_in") or data.get("expiresIn") or 43200
     state["stryd_token"]      = new_token
-    state["stryd_expires_at"] = now + expires_in
-    # Cognito may also rotate the refresh token
+    state["stryd_expires_at"] = now + int(expires_in)
     if "refresh_token" in data:
         state["stryd_refresh_token"] = data["refresh_token"]
     save_state(state)
-    print(f"  Stryd token refreshed (expires in {expires_in//3600:.0f}h)")
+    print(f"  Stryd token refreshed (expires in {int(expires_in)//3600:.0f}h)")
     return new_token
 
 def stryd_headers(token: str) -> dict:
@@ -806,7 +834,7 @@ def cmd_sync(apply: bool):
     if stryd_token:
         t_from = int((after_dt - timedelta(hours=1)).timestamp())
         t_to   = int(time.time()) + 86400
-        resp = requests.get(f"{STRYD_BASE}/users/{_stryd_user_id(state, stryd_token)}/calendar",
+        resp = requests.get(f"{STRYD_BASE}/users/{STRYD_USER_ID}/calendar",
                             headers=stryd_headers(stryd_token),
                             params={"from": t_from, "to": t_to, "include_deleted": "false"},
                             timeout=30)
@@ -1003,7 +1031,7 @@ def cmd_sync(apply: bool):
         # Fetch Stryd activities in the same window
         t_from = int((after_dt - timedelta(hours=1)).timestamp())
         t_to   = int(time.time()) + 86400
-        resp = requests.get(f"{STRYD_BASE}/users/{_stryd_user_id(state, stryd_token)}/calendar",
+        resp = requests.get(f"{STRYD_BASE}/users/{STRYD_USER_ID}/calendar",
                             headers=stryd_headers(stryd_token),
                             params={"from": t_from, "to": t_to, "include_deleted": "false"},
                             timeout=30)

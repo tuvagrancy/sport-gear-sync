@@ -1,0 +1,25 @@
+# State and credentials
+auto_sync_state.json
+*.json
+
+# Garmin session tokens
+.garminconnect/
+
+# Runalyze session
+.runalyze/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+dist/
+build/
+*.spec
+release/
+prepare_release.py
+diag_*.py
+gear_*.txt
+
+# OS
+.DS_Store
+Thumbs.db

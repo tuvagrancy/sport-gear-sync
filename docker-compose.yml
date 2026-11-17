@@ -1,0 +1,22 @@
+version: "3.8"
+
+services:
+  gear-sync:
+    image: gear-sync:latest
+    container_name: gear-sync
+    # Interactive mode needed for first-time setup (Garmin MFA prompt).
+    # For scheduled runs, stdin_open and tty can be removed.
+    stdin_open: true
+    tty: true
+    volumes:
+      # State file: Strava/Stryd tokens + last sync epoch
+      - /opt/docker/gear-sync/data:/app/data
+      # Garmin session tokens
+      - /opt/docker/gear-sync/garminconnect:/app/garminconnect
+    environment:
+      - STATE_FILE=/app/data/auto_sync_state.json
+      - GARMIN_TOKENS=/app/garminconnect
+    # Default command is dry run. For scheduled apply runs use:
+    #   command: ["python", "-I", "auto_sync.py", "--apply"]
+    command: ["python", "-I", "auto_sync.py"]
+    restart: "no"

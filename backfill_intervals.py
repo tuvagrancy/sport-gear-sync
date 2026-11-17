@@ -99,36 +99,55 @@ def load_strava(csv_path: str) -> list[dict]:
 
 
 def fetch_all_intervals_activities(ath: str, h: dict) -> dict[int, dict]:
-    """Return {garmin_activity_id: intervals_activity} for all activities."""
+    """Return {garmin_activity_id: intervals_activity} for all activities, fetched year by year."""
     out: dict[int, dict] = {}
-    page = 1
-    while True:
-        r = requests.get(
-            f"{BASE}/athlete/{ath}/activities",
-            headers=h,
-            params={"oldest": "2000-01-01", "newest": "2099-12-31",
-                    "limit": 200, "page": page},
-            timeout=TIMEOUT,
-        )
-        if r.status_code != 200:
-            print(f"  Activities page {page}: {r.status_code} {r.text[:100]}")
-            break
-        batch = r.json() or []
-        if not batch:
-            break
-        for a in batch:
-            ext = str(a.get("external_id") or "")
-            if ext.startswith("garmin:"):
+    current_year = datetime.now().year
+    for year in range(2020, current_year + 1):
+        oldest = f"{year}-01-01"
+        newest = f"{year}-12-31"
+        page = 1
+        while True:
+            try:
+                r = requests.get(
+                    f"{BASE}/athlete/{ath}/activities",
+                    headers=h,
+                    params={"oldest": oldest, "newest": newest,
+                            "limit": 100, "page": page},
+                    timeout=TIMEOUT,
+                    stream=False,
+                )
+            except Exception as e:
+                print(f"  {year} page {page}: {e} — retrying once")
+                time.sleep(2)
                 try:
-                    out[int(ext[7:])] = a
-                except ValueError:
-                    pass
-            elif ext.isdigit():
-                out[int(ext)] = a
-        if len(batch) < 200:
-            break
-        page += 1
-        time.sleep(0.2)
+                    r = requests.get(
+                        f"{BASE}/athlete/{ath}/activities",
+                        headers=h,
+                        params={"oldest": oldest, "newest": newest,
+                                "limit": 100, "page": page},
+                        timeout=TIMEOUT,
+                    )
+                except Exception as e2:
+                    print(f"  {year} page {page}: retry failed: {e2}")
+                    break
+            if r.status_code != 200:
+                print(f"  {year} page {page}: HTTP {r.status_code}")
+                break
+            batch = r.json() or []
+            for a in batch:
+                ext = str(a.get("external_id") or "")
+                if ext.startswith("garmin:"):
+                    try:
+                        out[int(ext[7:])] = a
+                    except ValueError:
+                        pass
+                elif ext.isdigit():
+                    out[int(ext)] = a
+            if len(batch) < 100:
+                break
+            page += 1
+            time.sleep(0.3)
+        print(f"  {year}: {sum(1 for a in out.values() if str(a.get('start_date_local',''))[:4] == str(year))} activities")
     return out
 
 

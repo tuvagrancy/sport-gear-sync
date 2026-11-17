@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Automatic gear sync: Strava -> Garmin Connect + Stryd.
+"""Automatic gear sync: Strava -> Garmin Connect + Stryd + Runalyze + Intervals.icu.
 
 First-time setup:
   python -I auto_sync.py --setup
@@ -11,6 +11,8 @@ Subsequent runs (manual or via Task Scheduler):
 The script only processes activities created since the last successful run,
 so it is safe to run frequently (e.g. every hour).
 """
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 import argparse
 import getpass
 import json
@@ -320,17 +322,16 @@ def stryd_ensure_token(state: dict) -> str | None:
     old_auth = _stryd_is_old_auth(token) if token else bool(refresh_client and "-" in refresh_client)
 
     if old_auth:
-        # Old Stryd backend: POST to Stryd's own auth endpoint
-        r = requests.post(
-            STRYD_OLD_AUTH,
-            json={
-                "grant_type":    "refresh_token",
-                "refresh_token": refresh_token,
-                "client_id":     refresh_client or "stryd",
-            },
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
-            timeout=30,
-        )
+        # Old Stryd backend (iss=stryd): refresh endpoint is not publicly documented
+        # and reverse-engineering has not found a working path.
+        # Return existing token; if it has expired, the caller will get a 401 and
+        # the user should run --setup to paste a fresh token from Local Storage.
+        if token:
+            remaining = (expires_at - int(time.time())) // 3600 if expires_at else 0
+            if remaining <= 0:
+                print("  Stryd token expired. Re-run --setup to paste a fresh token from Local Storage.")
+            return token
+        return None
     else:
         # New Cognito system
         r = requests.post(
@@ -631,6 +632,7 @@ def sync_runalyze_activity(client: RunalyzeClient,
         return "linked"
     return "failed:verify-mismatch"
 
+def cmd_setup():
     print("=== auto_sync setup (Enter to keep existing value) ===")
     state = load_state()
 

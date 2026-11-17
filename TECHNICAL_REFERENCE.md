@@ -241,18 +241,17 @@ is_old = payload.get("iss") == "stryd"   # True = 旧版，False = 新版 Cognit
 
 #### 旧版 Stryd 自家后端刷新
 
-```http
-POST https://api.stryd.com/b/api/v1/auth/token
-Content-Type: application/json
+实测结论：**旧版系统（`iss=stryd`）的 refresh token 端点未公开，无法通过 API 自动刷新。**
 
-{
-  "grant_type": "refresh_token",
-  "refresh_token": "<refreshToken>",
-  "client_id": "<refreshClientId 或 'stryd'>"
-}
+处理策略：
+- token 有效期约 12 小时，过期后脚本会打印提示
+- 需要手动从浏览器 Local Storage 重新复制 `token`，再跑一次 setup 更新
+- `refreshToken` 和 `refreshClientId` 对旧版系统无效，不需要收集
+
 ```
-
-响应字段：`token`（新 access token）、`expiresIn`（秒）、`refreshToken`（可能轮换）
+token 过期时提示：
+"Stryd token expired. Re-run --setup to paste a fresh token from Local Storage."
+```
 
 #### 新版 Cognito 刷新
 

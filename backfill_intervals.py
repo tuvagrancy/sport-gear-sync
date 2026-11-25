@@ -258,8 +258,8 @@ def main():
         garmin_id, icu_act = hits[0]
         icu_id = str(icu_act["id"])
 
-        cur_gear = icu_act.get("gear_id")
-        if cur_gear == target_id:
+        cur_gear = str((icu_act.get("gear") or {}).get("id") or "")
+        if cur_gear == str(target_id):
             already += 1
             continue
 
@@ -268,9 +268,9 @@ def main():
             continue
 
         r = requests.put(
-            f"{BASE}/athlete/{ath}/activities/{icu_id}",
+            f"{BASE}/activity/{icu_id}",
             headers=h,
-            json={"gear_id": target_id},
+            json={"gear": {"id": str(target_id)}},
             timeout=TIMEOUT,
         )
         time.sleep(0.3)
@@ -280,8 +280,8 @@ def main():
             continue
 
         # Verify
-        r2 = requests.get(f"{BASE}/athlete/{ath}/activities/{icu_id}", headers=h, timeout=TIMEOUT)
-        if r2.status_code == 200 and r2.json().get("gear_id") == target_id:
+        r2 = requests.get(f"{BASE}/activity/{icu_id}", headers=h, timeout=TIMEOUT)
+        if r2.status_code == 200 and str((r2.json().get("gear") or {}).get("id")) == str(target_id):
             linked += 1
         else:
             failed += 1

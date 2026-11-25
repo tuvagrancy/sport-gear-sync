@@ -322,16 +322,44 @@ def stryd_ensure_token(state: dict) -> str | None:
     old_auth = _stryd_is_old_auth(token) if token else bool(refresh_client and "-" in refresh_client)
 
     if old_auth:
-        # Old Stryd backend (iss=stryd): refresh endpoint is not publicly documented
-        # and reverse-engineering has not found a working path.
-        # Return existing token; if it has expired, the caller will get a 401 and
-        # the user should run --setup to paste a fresh token from Local Storage.
-        if token:
-            remaining = (expires_at - int(time.time())) // 3600 if expires_at else 0
-            if remaining <= 0:
-                print("  Stryd token expired. Re-run --setup to paste a fresh token from Local Storage.")
+        # Legacy Stryd backend (iss=stryd): POST /b/token/refresh.
+        # refresh_token and Client-ID rotate on every refresh and MUST be written back.
+        jwt_exp = int(_decode_jwt_payload(token).get("exp", 0)) if token else 0
+        if token and jwt_exp > now + 300:
             return token
-        return None
+        try:
+            r = requests.post(
+                "https://api.stryd.com/b/token/refresh",
+                headers={"Content-Type": "application/json", "Client-ID": refresh_client},
+                json={"refresh_token": refresh_token, "user_id": STRYD_USER_ID},
+                timeout=30,
+            )
+        except requests.RequestException as e:
+            print(f"  Stryd token refresh network error: {type(e).__name__}, using existing token.")
+            return token or None
+        if r.status_code == 403:
+            print("  Stryd session dead (refresh returned 403). Log in to PowerCenter again, then re-run --setup with the new refreshToken.")
+            return token or None
+        if r.status_code != 200:
+            print(f"  Stryd token refresh failed ({r.status_code}), using existing token.")
+            return token or None
+        try:
+            d = r.json()
+            d = d.get("data") if isinstance(d.get("data"), dict) else d
+            rt = d.get("refresh_token") or {}
+            new_token   = d["access_token"]
+            new_refresh = rt["token"]
+            new_client  = rt["client"]["id"]
+        except (ValueError, KeyError, TypeError, AttributeError):
+            print("  Stryd refresh response malformed, using existing token.")
+            return token or None
+        state["stryd_token"]             = new_token
+        state["stryd_expires_at"]        = int(_decode_jwt_payload(new_token).get("exp", 0)) or now + 43200
+        state["stryd_refresh_token"]     = new_refresh
+        state["stryd_refresh_client_id"] = str(new_client)
+        save_state(state)
+        print("  Stryd token refreshed (legacy auth, rotated refresh pair saved)")
+        return new_token
     else:
         # New Cognito system
         r = requests.post(
@@ -490,39 +518,35 @@ def sync_intervals_activity(state: dict,
     h   = _intervals_auth(state)
     h["Content-Type"] = "application/json"
 
+    # Intervals.icu stores gear as an object ({"id": ...}) and updates go to /activity/{id}
+    url = f"{INTERVALS_BASE}/activity/{intervals_id}"
+
     # Read current gear
-    r = requests.get(
-        f"{INTERVALS_BASE}/athlete/{ath}/activities/{intervals_id}",
-        headers=h, timeout=30,
-    )
+    r = requests.get(url, headers=h, timeout=30)
     if r.status_code != 200:
         return f"failed:read:{r.status_code}"
-    cur_gear = (r.json() or {}).get("gear_id")
-    if cur_gear == target_id:
+    cur_gear = str(((r.json() or {}).get("gear") or {}).get("id") or "")
+    if cur_gear == str(target_id):
         return "already-correct"
 
     if not apply:
         return f"dry-run:would-set:{gear_name}"
 
-    r2 = requests.put(
-        f"{INTERVALS_BASE}/athlete/{ath}/activities/{intervals_id}",
-        headers=h,
-        json={"gear_id": target_id},
-        timeout=30,
-    )
+    r2 = requests.put(url, headers=h, json={"gear": {"id": str(target_id)}}, timeout=30)
+    if r2.status_code == 422 and "Strava" in r2.text:
+        # Activities imported directly from Strava cannot be edited via the API
+        return "skipped:strava-source"
     if r2.status_code not in (200, 204):
         return f"failed:write:{r2.status_code}:{r2.text[:80]}"
 
     # Verify
-    r3 = requests.get(
-        f"{INTERVALS_BASE}/athlete/{ath}/activities/{intervals_id}",
-        headers=h, timeout=30,
-    )
-    if r3.status_code == 200 and r3.json().get("gear_id") == target_id:
+    r3 = requests.get(url, headers=h, timeout=30)
+    if r3.status_code == 200 and str(((r3.json() or {}).get("gear") or {}).get("id")) == str(target_id):
         return "linked"
     return "failed:verify-mismatch"
 
 
+def _load_runalyze_maps(client: RunalyzeClient, state: dict):
     """Populate global gear and activity maps from Runalyze."""
     global RUNALYZE_SHOE_CAT, RUNALYZE_BIKE_CAT
 
@@ -875,10 +899,21 @@ def cmd_sync(apply: bool):
         except Exception as e:
             print(f"  Runalyze: unavailable ({e})")
 
+    # Intervals.icu
+    intervals_ok = False
+    if state.get("intervals_athlete_id") and state.get("intervals_api_key"):
+        try:
+            _load_intervals_maps(state)
+            _load_intervals_activities(state, start_date, end_date)
+            intervals_ok = True
+            print(f"  Intervals: {len(_intervals_gear_map)} gear, {len(_intervals_activity_map)} activities indexed")
+        except Exception as e:
+            print(f"  Intervals: unavailable ({e})")
+
     # ── Step 3: for each Strava activity, determine gear source and sync ───────
     print("\n-- Syncing --")
     stats = {p: {"linked": 0, "already-correct": 0, "no-match": 0, "other": 0}
-             for p in ("garmin", "stryd", "runalyze")}
+             for p in ("garmin", "stryd", "runalyze", "intervals")}
 
     for sa in strava_acts:
         s_start = _strava_start_utc(sa)
@@ -951,6 +986,15 @@ def cmd_sync(apply: bool):
             if key not in ("already-correct", "linked", "not-on-runalyze", "no_field"):
                 print(f"  Runalyze [{s_start:%Y-%m-%d %H:%M}] {status}")
 
+        # ── Intervals.icu sync ──
+        if intervals_ok and gm:
+            status = sync_intervals_activity(state, gm["activityId"], gear_name, atype, apply)
+            key = status.split(":")[0]
+            bucket = {"not-on-intervals": "no-match"}.get(key, key)
+            stats["intervals"][bucket if bucket in stats["intervals"] else "other"] += 1
+            if key not in ("already-correct", "linked", "not-on-intervals"):
+                print(f"  Intervals [{s_start:%Y-%m-%d %H:%M}] {status}")
+
     # ── Summary ────────────────────────────────────────────────────────────────
     print("\n== Summary ==")
     for plat, s in stats.items():
@@ -963,204 +1007,6 @@ def cmd_sync(apply: bool):
         print(f"\nDone. Next run processes activities after {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC.")
     else:
         print("\nDry run. Add --apply to write.")
-
-    # --- Strava: fetch new activities ---
-    strava_token   = strava_refresh(state)
-    after_epoch    = state.get("last_sync_epoch", 0)
-    after_dt       = datetime.fromtimestamp(after_epoch, tz=timezone.utc)
-    print(f"Fetching Strava activities since {after_dt.strftime('%Y-%m-%d %H:%M')} UTC ...")
-    strava_acts    = fetch_strava_activities(strava_token, after_epoch)
-    with_gear      = [a for a in strava_acts if a.get("gear_id")]
-    print(f"  {len(strava_acts)} new activities, {len(with_gear)} have gear")
-
-    if not with_gear:
-        print("Nothing to sync.")
-        if apply and strava_acts:
-            state["last_sync_epoch"] = int(time.time())
-            save_state(state)
-        return
-
-    # --- Resolve Strava gear IDs to gear names ---
-    strava_gear_names: dict[str, str] = {}
-    for a in with_gear:
-        gid = a["gear_id"]
-        if gid not in strava_gear_names:
-            g = fetch_strava_gear(gid, strava_token)
-            strava_gear_names[gid] = g.get("name", gid)
-
-    # --- Garmin ---
-    print("\n-- Garmin --")
-    garmin = garmin_login()
-    gear_map = load_garmin_gear(garmin)
-
-    # Fetch Garmin activities in the same window
-    start_date = (after_dt - timedelta(hours=1)).strftime("%Y-%m-%d")
-    end_date   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    garmin_acts = garmin.get_activities_by_date(start_date, end_date)
-
-    def garmin_start(a):
-        s = a.get("startTimeGMT")
-        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S") if s else None
-    def garmin_km(a):
-        return (a.get("distance") or 0) / 1000
-
-    garmin_stats = {"linked": 0, "already-correct": 0, "no-match": 0, "other": 0}
-    for a in with_gear:
-        gear_name   = strava_gear_names[a["gear_id"]]
-        target_name = garmin_gear_name(a["type"], gear_name)
-        s_start     = _strava_start_utc(a)
-        s_km        = _strava_km(a)
-        match       = find_match(s_start, s_km, garmin_acts, garmin_start, garmin_km)
-        if match is None:
-            print(f"  no Garmin match: {s_start:%Y-%m-%d %H:%M} {s_km:.1f}km [{gear_name}]")
-            garmin_stats["no-match"] += 1
-            continue
-        status = sync_garmin_activity(garmin, match, target_name, gear_map, apply)
-        key = status.split(":")[0]
-        garmin_stats[key if key in garmin_stats else "other"] = garmin_stats.get(key if key in garmin_stats else "other", 0) + 1
-        if key not in ("already-correct", "linked"):
-            print(f"  Garmin [{s_start:%Y-%m-%d %H:%M}] {status}")
-    print(f"  linked={garmin_stats['linked']}  already-correct={garmin_stats['already-correct']}  no-match={garmin_stats['no-match']}  other={garmin_stats.get('other',0)}")
-
-    # --- Stryd (run activities only) ---
-    print("\n-- Stryd --")
-    stryd_token = state.get("stryd_token", "")
-    if not stryd_token:
-        print("  No Stryd token configured — skipping. Re-run --setup to add it.")
-    else:
-        run_acts = [a for a in with_gear if a["type"] in RUN_TYPES]
-
-        # Fetch Stryd activities in the same window
-        t_from = int((after_dt - timedelta(hours=1)).timestamp())
-        t_to   = int(time.time()) + 86400
-        resp = requests.get(f"{STRYD_BASE}/users/{STRYD_USER_ID}/calendar",
-                            headers=stryd_headers(stryd_token),
-                            params={"from": t_from, "to": t_to, "include_deleted": "false"},
-                            timeout=30)
-        if resp.status_code == 401:
-            print("  Stryd token expired — skipping. Re-run --setup to refresh it.")
-            stryd_token = None
-        elif resp.status_code != 200:
-            print(f"  Stryd calendar error {resp.status_code} — skipping.")
-            stryd_token = None
-
-        if stryd_token:
-            data = resp.json()
-            stryd_acts = []
-            if isinstance(data, dict):
-                for v in data.values():
-                    if isinstance(v, list):
-                        stryd_acts.extend(v)
-                    elif isinstance(v, dict) and "id" in v:
-                        stryd_acts.append(v)
-            elif isinstance(data, list):
-                stryd_acts = data
-
-            def stryd_start(a):
-                ts = a.get("timestamp") or a.get("start_time")
-                if isinstance(ts, (int, float)):
-                    return datetime.fromtimestamp(ts, tz=timezone.utc).replace(tzinfo=None)
-                return None
-            def stryd_km(a):
-                d = a.get("distance")
-                return d / 1000 if d and d > 1000 else d
-
-            stryd_stats = {"linked": 0, "already-correct": 0, "no-match": 0, "other": 0}
-            for a in run_acts:
-                gear_name = strava_gear_names[a["gear_id"]]
-                s_start   = _strava_start_utc(a)
-                s_km      = _strava_km(a)
-                match     = find_match(s_start, s_km, stryd_acts, stryd_start, stryd_km)
-                if match is None:
-                    print(f"  no Stryd match: {s_start:%Y-%m-%d %H:%M} {s_km:.1f}km [{gear_name}]")
-                    stryd_stats["no-match"] += 1
-                    continue
-                status = sync_stryd_activity(match, gear_name, stryd_token, apply)
-                key = status.split(":")[0]
-                stryd_stats[key if key in stryd_stats else "other"] = stryd_stats.get(key if key in stryd_stats else "other", 0) + 1
-                if key not in ("already-correct", "linked"):
-                    print(f"  Stryd [{s_start:%Y-%m-%d %H:%M}] {status}")
-            print(f"  linked={stryd_stats['linked']}  already-correct={stryd_stats['already-correct']}  no-match={stryd_stats['no-match']}  other={stryd_stats.get('other',0)}")
-
-    # --- Runalyze ---
-    print("\n-- Runalyze --")
-    from runalyze_client import RunalyzeClient, load_credentials
-    if not load_credentials():
-        print("  No Runalyze credentials — skipping. Run --setup to configure.")
-    else:
-        try:
-            rc = RunalyzeClient()
-            _load_runalyze_maps(rc, state)
-            if not RUNALYZE_SHOE_CAT:
-                print("  Shoe category id not set — skipping. Re-run --setup.")
-            else:
-                # Build Garmin activity id -> Strava activity map for fast lookup
-                garmin_id_to_strava: dict[int, dict] = {}
-                for sa in with_gear:
-                    gm = find_match(
-                        _strava_start_utc(sa), _strava_km(sa),
-                        garmin_acts,
-                        lambda a: (datetime.strptime(a["startTimeGMT"], "%Y-%m-%d %H:%M:%S")
-                                   if a.get("startTimeGMT") else None),
-                        lambda a: (a.get("distance") or 0) / 1000,
-                    )
-                    if gm:
-                        garmin_id_to_strava[gm["activityId"]] = sa
-
-                runa_stats = {"linked": 0, "already-correct": 0,
-                              "not-on-runalyze": 0, "no_field": 0, "other": 0}
-                for garmin_id, sa in garmin_id_to_strava.items():
-                    gear_name = strava_gear_names[sa["gear_id"]]
-                    status    = sync_runalyze_activity(
-                        rc, garmin_id, gear_name, sa["type"], apply
-                    )
-                    time.sleep(0.4)
-                    key = status.split(":")[0]
-                    bucket = key if key in runa_stats else "other"
-                    runa_stats[bucket] = runa_stats.get(bucket, 0) + 1
-                    if key not in ("already-correct", "linked", "not-on-runalyze", "no_field"):
-                        print(f"  Runalyze [{_strava_start_utc(sa):%Y-%m-%d %H:%M}] {status}")
-                print(f"  linked={runa_stats['linked']}  already-correct={runa_stats['already-correct']}"
-                      f"  not-on-runalyze={runa_stats['not-on-runalyze']}"
-                      f"  no_field={runa_stats['no_field']}  other={runa_stats.get('other',0)}")
-        except Exception as e:
-            print(f"  Runalyze sync error: {e}")
-
-    # --- Intervals.icu ---
-    print("\n-- Intervals.icu --")
-    if not state.get("intervals_athlete_id") or not state.get("intervals_api_key"):
-        print("  Not configured — skipping. Run --setup to add credentials.")
-    else:
-        try:
-            _load_intervals_maps(state)
-            # Load activity id map for the same date window
-            _load_intervals_activities(state, start_date, end_date)
-            print(f"  {len(_intervals_gear_map)} gear items, {len(_intervals_activity_map)} activities indexed")
-
-            icu_stats = {"linked": 0, "already-correct": 0,
-                         "not-on-intervals": 0, "other": 0}
-            for garmin_id, sa in garmin_id_to_strava.items():
-                gear_name = strava_gear_names[sa["gear_id"]]
-                status    = sync_intervals_activity(
-                    state, garmin_id, gear_name, sa["type"], apply
-                )
-                key = status.split(":")[0]
-                bucket = key if key in icu_stats else "other"
-                icu_stats[bucket] = icu_stats.get(bucket, 0) + 1
-                if key not in ("already-correct", "linked", "not-on-intervals"):
-                    print(f"  Intervals [{_strava_start_utc(sa):%Y-%m-%d %H:%M}] {status}")
-            print(f"  linked={icu_stats['linked']}  already-correct={icu_stats['already-correct']}"
-                  f"  not-on-intervals={icu_stats['not-on-intervals']}  other={icu_stats.get('other',0)}")
-        except Exception as e:
-            print(f"  Intervals.icu sync error: {e}")
-
-    # --- Update last sync time ---
-    if apply:
-        state["last_sync_epoch"] = int(time.time())
-        save_state(state)
-        print(f"\nSync complete. Next run will process activities after {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC.")
-    else:
-        print("\nDry run complete. Add --apply to write.")
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main():

@@ -52,6 +52,7 @@ class _FormParser(HTMLParser):
         elif tag == "option":
             if self._cur_select is not None:
                 self._cur_option_val = val
+                self.selects[self._cur_select][val] = ""
                 if "selected" in a:
                     self.selected[self._cur_select] = val
 

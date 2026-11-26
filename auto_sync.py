@@ -43,6 +43,12 @@ RUNALYZE_BIKE_CAT = 0   # filled in at setup from the API
 # Garmin gear name -> Runalyze equipment id (int).
 # Populated at runtime from /_internal/data/equipment/combined.
 _runalyze_gear_map: dict[str, int] = {}
+
+# Display name used by this script -> actual equipment name in Runalyze.
+# Only consulted when the exact name is not found in Runalyze.
+RUNALYZE_NAME_ALIASES: dict[str, str] = {
+    "Nike Vomero Plus": "Nike Voremo Plus",
+}
 _runalyze_activity_map: dict[int, int] = {}   # garmin_activity_id -> runalyze_activity_id
 
 # ── Intervals.icu config ───────────────────────────────────────────────────────
@@ -608,7 +614,8 @@ def sync_runalyze_activity(client: RunalyzeClient,
             target_name = f"{brand} {model}"
         else:
             target_name = strava_gear_name
-    target_eq_id = _runalyze_gear_map.get(target_name)
+    target_eq_id = (_runalyze_gear_map.get(target_name)
+                    or _runalyze_gear_map.get(RUNALYZE_NAME_ALIASES.get(target_name, "")))
     if not target_eq_id:
         return f"no-runalyze-equipment:{target_name}"
 
